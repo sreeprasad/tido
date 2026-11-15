@@ -4,6 +4,11 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-13",
   "observability": { "enabled": true },
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/ws/*", "/ping/*"]
+  },
   "durable_objects": {
     "bindings": [
       { "name": "ROOM", "class_name": "RoomDO" },

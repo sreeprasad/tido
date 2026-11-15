@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tido</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafaf7; --card:#fff; --line:#e5e5e0; --accent:#4f46e5; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#f2f2f0; --muted:#a1a1a6; --bg:#141414; --card:#1e1e1e; --line:#2e2e2e; --accent:#818cf8; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.6 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width:520px; margin:0 auto; padding:48px 20px; }
+  h1 { font-size:28px; margin:0 0 4px; } .muted { color:var(--muted); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin:20px 0; }
+  button, input { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; cursor:pointer; }
+  .row { display:flex; gap:8px; } .row input { flex:1; text-transform:lowercase; }
+  .code { font:600 40px/1 ui-monospace, monospace; letter-spacing:6px; }
+  .link { display:flex; gap:8px; align-items:center; } .link input { flex:1; font-size:13px; }
+  .err { color:#dc2626; }
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+const app = document.getElementById("app");
+const el = (html) => { app.innerHTML = html; };
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const CODE_RE = /^[23456789abcdefghjkmnpqrstuvwxyz]{6}$/;
+
+function uid() {
+  let id = localStorage.getItem("tido:uid");
+  if (!id) { id = crypto.randomUUID(); localStorage.setItem("tido:uid", id); }
+  return id;
+}
+
+function copyRow(label, value) {
+  return `<div class="muted" style="font-size:13px;margin-top:12px">${esc(label)}</div>
+    <div class="link"><input readonly value="${esc(value)}"><button onclick="navigator.clipboard.writeText(this.previousElementSibling.value);this.textContent='Copied'">Copy</button></div>`;
+}
+
+function landing() {
+  el(`<h1>Tido</h1><p class="muted">Live polls and Q&amp;A. No sign-up.</p>
+    <div class="card"><button class="primary" id="new">New room</button> <span id="newErr" class="err"></span></div>
+    <div class="card"><div class="muted" style="margin-bottom:8px">Join a room</div>
+      <form class="row" id="join"><input id="code" placeholder="6-character code" maxlength="6" autocomplete="off"><button class="primary">Join</button></form>
+      <div id="joinErr" class="err"></div></div>`);
+  document.getElementById("new").onclick = async () => {
+    const r = await fetch("/api/rooms", { method: "POST" });
+    if (!r.ok) { document.getElementById("newErr").textContent = "Could not create room"; return; }
+    const { code, hostToken } = await r.json();
+    localStorage.setItem("tido:host:" + code, hostToken);
+    location.href = "/host/" + code;
+  };
+  document.getElementById("join").onsubmit = (e) => {
+    e.preventDefault();
+    const code = document.getElementById("code").value.trim().toLowerCase();
+    if (!CODE_RE.test(code)) { document.getElementById("joinErr").textContent = "Enter a valid 6-character code"; return; }
+    location.href = "/r/" + code;
+  };
+}
+
+async function host(code) {
+  const hash = new URLSearchParams(location.hash.slice(1));
+  if (hash.get("t")) { localStorage.setItem("tido:host:" + code, hash.get("t")); history.replaceState(null, "", location.pathname); }
+  const token = localStorage.getItem("tido:host:" + code);
+  if (!token) return el(`<h1>Not authorized</h1><p class="muted">Open the host link you saved when creating this room.</p>`);
+  const r = await fetch(`/api/rooms/${code}/host`, { method: "POST", headers: { authorization: "Bearer " + token } });
+  if (!r.ok) return el(`<h1>Not authorized</h1><p class="muted">This host link is invalid for room ${esc(code)}.</p>`);
+  const base = location.origin;
+  el(`<p class="muted">Host view</p><div class="code">${esc(code)}</div>
+    <div class="card">${copyRow("Audience link — share this", `${base}/r/${code}`)}
+    ${copyRow("Host link — keep private (opens host view on another device)", `${base}/host/${code}#t=${token}`)}</div>
+    <p class="muted">Polls and Q&amp;A arrive in M4–M5.</p>`);
+}
+
+async function audience(code) {
+  const r = await fetch(`/api/rooms/${code}`);
+  if (r.status === 404) return el(`<h1>Room not found</h1><p class="muted">Check the code and try again. <a href="/">Back</a></p>`);
+  if (!r.ok) return el(`<h1>Something went wrong</h1>`);
+  el(`<p class="muted">You're in</p><div class="code">${esc(code)}</div>
+    <div class="card muted">Waiting for the host… <br><span style="font-size:13px">Your anonymous ID: ${esc(uid().slice(0, 8))}</span></div>`);
+}
+
+const [, kind, rawCode] = location.pathname.split("/");
+const code = (rawCode || "").toLowerCase();
+if (kind === "host" && CODE_RE.test(code)) host(code);
+else if (kind === "r" && CODE_RE.test(code)) audience(code);
+else landing();
+</script>
+</body>
+</html>
