@@ -1,0 +1,8 @@
+{
+	"name": "tido",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-13",
+	"observability": {
+		"enabled": true,
+	},
+}
