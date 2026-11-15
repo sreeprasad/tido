@@ -1,18 +1,19 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+export { RoomDO } from "./room";
+export { ShardDO } from "./shard";
 
 export default {
-	async fetch(request, env, ctx): Promise<Response> {
-		return new Response("Hello World!");
-	},
+  async fetch(req, env): Promise<Response> {
+    const url = new URL(req.url);
+
+    const ping = url.pathname.match(/^\/ping\/([a-z0-9]{1,12})$/i);
+    if (ping) {
+      const code = ping[1].toLowerCase();
+      const room = env.ROOM.getByName(code);
+      const shard = env.SHARD.getByName(`${code}:0`);
+      const [roomState, shardState] = await Promise.all([room.ping(code), shard.ping()]);
+      return Response.json({ room: roomState, shard: shardState });
+    }
+
+    return new Response("Tido", { headers: { "content-type": "text/plain" } });
+  },
 } satisfies ExportedHandler<Env>;
