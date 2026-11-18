@@ -3,6 +3,7 @@ export { ShardDO } from "./shard";
 
 const CODE_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz";
 const CODE_RE = /^[23456789abcdefghjkmnpqrstuvwxyz]{6}$/;
+const UID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function randomCode(len = 6): string {
   const bytes = crypto.getRandomValues(new Uint8Array(len));
@@ -19,6 +20,16 @@ async function sha256(text: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** FNV-1a: stable, fast hash so a user always lands on the same shard. */
+function fnv1a(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 function bearer(req: Request): string | null {
   const h = req.headers.get("authorization") ?? "";
   const m = h.match(/^Bearer ([a-f0-9]{64})$/);
@@ -29,6 +40,27 @@ export default {
   async fetch(req, env): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+
+    // WebSocket: route to a shard
+    const wsMatch = path.match(/^\/ws\/([^/]+)$/);
+    if (wsMatch) {
+      if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+        return new Response("Expected WebSocket", { status: 426 });
+      }
+      const code = wsMatch[1].toLowerCase();
+      const uid = (url.searchParams.get("uid") ?? "").toLowerCase();
+      if (!CODE_RE.test(code) || !UID_RE.test(uid)) return new Response("bad request", { status: 400 });
+
+      const info = await env.ROOM.getByName(code).info();
+      if (!info) return new Response("room not found", { status: 404 });
+
+      const shardName = `${code}:${fnv1a(uid) % info.shardCount}`;
+      const fwd = new URL(req.url);
+      fwd.searchParams.set("code", code);
+      fwd.searchParams.set("shard", shardName);
+      fwd.searchParams.set("uid", uid);
+      return env.SHARD.getByName(shardName).fetch(new Request(fwd, req));
+    }
 
     // Create a room
     if (path === "/api/rooms" && req.method === "POST") {
@@ -60,6 +92,6 @@ export default {
       return Response.json({ host: ok }, { status: ok ? 200 : 401 });
     }
 
-    return new Response("Tido", { headers: { "content-type": "text/plain" } });
+    return new Response("not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;

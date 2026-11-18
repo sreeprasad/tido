@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tido</title>
 <style>
-  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafaf7; --card:#fff; --line:#e5e5e0; --accent:#4f46e5; }
+  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafaf7; --card:#fff; --line:#e5e5e0; --accent:#4f46e5; --ok:#16a34a; --warn:#d97706; }
   @media (prefers-color-scheme: dark) { :root { --fg:#f2f2f0; --muted:#a1a1a6; --bg:#141414; --card:#1e1e1e; --line:#2e2e2e; --accent:#818cf8; } }
   * { box-sizing: border-box; }
   body { margin:0; font:16px/1.6 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
@@ -18,6 +18,9 @@
   .code { font:600 40px/1 ui-monospace, monospace; letter-spacing:6px; }
   .link { display:flex; gap:8px; align-items:center; } .link input { flex:1; font-size:13px; }
   .err { color:#dc2626; }
+  .status { display:inline-flex; align-items:center; gap:6px; font-size:14px; color:var(--muted); }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--warn); }
+  .dot.live { background:var(--ok); }
 </style>
 </head>
 <body>
@@ -32,6 +35,39 @@ function uid() {
   let id = localStorage.getItem("tido:uid");
   if (!id) { id = crypto.randomUUID(); localStorage.setItem("tido:uid", id); }
   return id;
+}
+
+/** Live connection with auto-reconnect (exponential backoff + jitter) and free keepalives. */
+function live(code, onMsg) {
+  let tries = 0, pingTimer = null, total = null, state = "connecting";
+  const render = () => {
+    const s = document.getElementById("status");
+    if (!s) return;
+    const here = total === null ? "" : ` · ${total} here`;
+    s.innerHTML = `<span class="dot ${state === "live" ? "live" : ""}"></span>${state === "live" ? "live" : esc(state)}${here}`;
+  };
+  const open = () => {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws/${code}?uid=${uid()}`);
+    ws.onopen = () => {
+      tries = 0; state = "live"; render();
+      pingTimer = setInterval(() => { if (ws.readyState === 1) ws.send("ping"); }, 30000);
+    };
+    ws.onmessage = (e) => {
+      if (e.data === "pong") return;
+      let msg; try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type === "presence") { total = msg.total; render(); }
+      onMsg && onMsg(msg);
+    };
+    ws.onclose = () => {
+      clearInterval(pingTimer);
+      state = "reconnecting"; render();
+      const delay = Math.min(10000, 500 * 2 ** tries++) * (0.5 + Math.random());
+      setTimeout(open, delay);
+    };
+  };
+  render();
+  open();
 }
 
 function copyRow(label, value) {
@@ -68,18 +104,20 @@ async function host(code) {
   const r = await fetch(`/api/rooms/${code}/host`, { method: "POST", headers: { authorization: "Bearer " + token } });
   if (!r.ok) return el(`<h1>Not authorized</h1><p class="muted">This host link is invalid for room ${esc(code)}.</p>`);
   const base = location.origin;
-  el(`<p class="muted">Host view</p><div class="code">${esc(code)}</div>
+  el(`<p class="muted">Host view · <span id="status" class="status"></span></p><div class="code">${esc(code)}</div>
     <div class="card">${copyRow("Audience link — share this", `${base}/r/${code}`)}
     ${copyRow("Host link — keep private (opens host view on another device)", `${base}/host/${code}#t=${token}`)}</div>
     <p class="muted">Polls and Q&amp;A arrive in M4–M5.</p>`);
+  live(code);
 }
 
 async function audience(code) {
   const r = await fetch(`/api/rooms/${code}`);
   if (r.status === 404) return el(`<h1>Room not found</h1><p class="muted">Check the code and try again. <a href="/">Back</a></p>`);
   if (!r.ok) return el(`<h1>Something went wrong</h1>`);
-  el(`<p class="muted">You're in</p><div class="code">${esc(code)}</div>
+  el(`<p class="muted">You're in · <span id="status" class="status"></span></p><div class="code">${esc(code)}</div>
     <div class="card muted">Waiting for the host… <br><span style="font-size:13px">Your anonymous ID: ${esc(uid().slice(0, 8))}</span></div>`);
+  live(code);
 }
 
 const [, kind, rawCode] = location.pathname.split("/");
