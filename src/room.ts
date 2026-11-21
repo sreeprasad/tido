@@ -23,6 +23,10 @@ export type Results = {
 
 export type Snapshot = { poll: Poll | null; results: Results | null; presence: number };
 
+export type PastPoll = { poll: Poll; counts: number[]; voters: number; createdAt: string };
+
+export type RoomInfo = { code: string; createdAt: string; shardCount: number; closed: boolean; closedAt: string | null };
+
 type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 
 export class RoomDO extends DurableObject<Env> {
@@ -57,6 +61,10 @@ export class RoomDO extends DurableObject<Env> {
     );
   }
 
+  private isClosed(): boolean {
+    return this.get("closed_at") !== null;
+  }
+
   private activePoll(): Poll | null {
     const id = this.get("active_poll");
     if (!id) return null;
@@ -76,7 +84,7 @@ export class RoomDO extends DurableObject<Env> {
     );
   }
 
-  private results(p: Poll): Results {
+  private totals(p: Poll): { counts: number[]; voters: number } {
     const rows = this.ctx.storage.sql
       .exec<{ counts: string; voters: number }>(
         `SELECT counts, voters FROM shard_votes WHERE poll_id = ? AND round = ?`,
@@ -91,6 +99,11 @@ export class RoomDO extends DurableObject<Env> {
       for (let i = 0; i < counts.length; i++) counts[i] += c[i] ?? 0;
       voters += r.voters;
     }
+    return { counts, voters };
+  }
+
+  private results(p: Poll): Results {
+    const { counts, voters } = this.totals(p);
     const hidden = p.showResults === "after" && p.state !== "closed";
     return { type: "results", pollId: p.id, round: p.round, counts, voters, hidden };
   }
@@ -128,19 +141,49 @@ export class RoomDO extends DurableObject<Env> {
     return true;
   }
 
-  async info(): Promise<{ code: string; createdAt: string; shardCount: number } | null> {
+  async info(): Promise<RoomInfo | null> {
     const code = this.get("code");
     if (!code) return null;
+    const closedAt = this.get("closed_at");
     return {
       code,
       createdAt: this.get("created_at")!,
       shardCount: Number(this.get("shard_count") ?? "1"),
+      closed: closedAt !== null,
+      closedAt,
     };
   }
 
   async isHost(tokenHash: string): Promise<boolean> {
     const stored = this.get("host_hash");
     return stored !== null && stored === tokenHash;
+  }
+
+  /** Ends the room: closes the active poll, tells every client, blocks new polls and votes. */
+  async closeRoom(): Promise<Result<RoomInfo>> {
+    if (!this.isClosed()) {
+      const p = this.activePoll();
+      if (p && p.state !== "closed") {
+        p.state = "closed";
+        this.savePoll(p);
+        await this.fanout({ type: "poll", poll: p });
+        await this.broadcastResults(p);
+      }
+      this.set("closed_at", new Date().toISOString());
+      await this.fanout({ type: "room", closed: true });
+    }
+    return { ok: true, value: (await this.info())! };
+  }
+
+  /** Every poll in this room, oldest first, with its final counts (host only). */
+  async listPolls(): Promise<PastPoll[]> {
+    return this.ctx.storage.sql
+      .exec<{ data: string; created_at: string }>(`SELECT data, created_at FROM polls ORDER BY created_at ASC`)
+      .toArray()
+      .map((row) => {
+        const poll = JSON.parse(row.data) as Poll;
+        return { poll, ...this.totals(poll), createdAt: row.created_at };
+      });
   }
 
   // ---------- called by shards ----------
@@ -155,7 +198,7 @@ export class RoomDO extends DurableObject<Env> {
     return { poll, results: poll ? this.results(poll) : null, presence: this.presence() };
   }
 
-  /** Shard reports socket count and its absolute vote tally (idempotent). */
+  /** Shard reports unique-people count and its absolute vote tally (idempotent). */
   async report(shardName: string, sockets: number, tally: Tally | null): Promise<void> {
     const sql = this.ctx.storage.sql;
     sql.exec(
@@ -187,6 +230,7 @@ export class RoomDO extends DurableObject<Env> {
   // ---------- host actions ----------
 
   async createPoll(input: unknown): Promise<Result<Poll>> {
+    if (this.isClosed()) return { ok: false, error: "room is closed" };
     const i = (input ?? {}) as Record<string, unknown>;
     const question = typeof i.question === "string" ? i.question.trim() : "";
     if (question.length < 1 || question.length > 200) return { ok: false, error: "question must be 1–200 characters" };
@@ -200,10 +244,16 @@ export class RoomDO extends DurableObject<Env> {
       question,
       options,
       multi: i.multi === true,
-      showResults: i.showResults === "after" ? "after" : "live",
+      showResults: i.showResults === "live" ? "live" : "after",
       state: "draft",
       round: 1,
     };
+    // Starting a new poll closes the previous one if it was still open.
+    const prev = this.activePoll();
+    if (prev && prev.state === "open") {
+      prev.state = "closed";
+      this.savePoll(prev);
+    }
     this.savePoll(poll);
     this.set("active_poll", poll.id);
     await this.fanout({ type: "poll", poll });
@@ -212,6 +262,7 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   async setPollState(id: string, action: "open" | "close" | "reset"): Promise<Result<Poll>> {
+    if (this.isClosed()) return { ok: false, error: "room is closed" };
     const p = this.activePoll();
     if (!p || p.id !== id) return { ok: false, error: "poll not found or not active" };
     if (action === "open") p.state = "open";

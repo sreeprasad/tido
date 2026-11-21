@@ -102,15 +102,16 @@ export class ShardDO extends DurableObject<Env> {
     const meta = await this.ctx.storage.get<ShardMeta>("meta");
     if (!meta) return;
     const poll = (await this.ctx.storage.get<Poll | null>("poll")) ?? null;
-    const sockets = new Set(this.ctx.getWebSockets().map((w) => (w.deserializeAttachment() as Attachment).uid)).size;
-    await this.env.ROOM.getByName(meta.code).report(meta.name, sockets, poll ? this.tally(poll) : null);
+    // Count unique people, not connections (one person may have several tabs open).
+    const people = new Set(this.ctx.getWebSockets().map((w) => (w.deserializeAttachment() as Attachment).uid)).size;
+    await this.env.ROOM.getByName(meta.code).report(meta.name, people, poll ? this.tally(poll) : null);
   }
 
   // ---------- messages from the room ----------
 
   /** Called by RoomDO to broadcast to every socket on this shard. */
   async push(msg: string) {
-    const obj = JSON.parse(msg) as { type: string; poll?: Poll; hidden?: boolean };
+    const obj = JSON.parse(msg) as { type: string; poll?: Poll; hidden?: boolean; closed?: boolean };
     if (obj.type === "poll") await this.ctx.storage.put("poll", obj.poll ?? null);
 
     const audienceMsg = obj.type === "results" && obj.hidden ? JSON.stringify({ ...obj, counts: null }) : msg;
@@ -119,6 +120,15 @@ export class ShardDO extends DurableObject<Env> {
       try {
         ws.send(att.role === "host" ? msg : audienceMsg);
       } catch {}
+    }
+
+    // Room ended: disconnect everyone (clients stop reconnecting when they see this message).
+    if (obj.type === "room" && obj.closed) {
+      for (const ws of this.ctx.getWebSockets()) {
+        try {
+          ws.close(1000, "room closed");
+        } catch {}
+      }
     }
   }
 
@@ -172,6 +182,7 @@ export class ShardDO extends DurableObject<Env> {
       att.uid,
       JSON.stringify(options)
     );
+    // Tell every tab this person has open, so they all highlight the same choice.
     const voted = JSON.stringify({ type: "voted", pollId: poll.id, round: poll.round, options });
     for (const s of this.ctx.getWebSockets(att.uid)) {
       try {

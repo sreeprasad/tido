@@ -1,3 +1,5 @@
+import type { PastPoll } from "./room";
+
 export { RoomDO } from "./room";
 export { ShardDO } from "./shard";
 
@@ -55,6 +57,30 @@ async function readJson(req: Request): Promise<unknown> {
   }
 }
 
+/** CSV cell: quote when needed, and neutralize spreadsheet formula injection (=, +, -, @). */
+function csvCell(v: string | number): string {
+  let s = String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function pollsToCsv(polls: PastPoll[]): string {
+  const header = ["poll_number", "question", "state", "type", "option", "votes", "percent_of_voters", "voters", "created_at"];
+  const lines = [header.join(",")];
+  polls.forEach((p, n) => {
+    p.poll.options.forEach((opt, i) => {
+      const votes = p.counts[i] ?? 0;
+      const pct = p.voters ? Math.round((1000 * votes) / p.voters) / 10 : 0;
+      lines.push(
+        [n + 1, p.poll.question, p.poll.state, p.poll.multi ? "multiple" : "single", opt, votes, pct, p.voters, p.createdAt]
+          .map(csvCell)
+          .join(",")
+      );
+    });
+  });
+  return lines.join("\r\n") + "\r\n";
+}
+
 export default {
   async fetch(req, env): Promise<Response> {
     const url = new URL(req.url);
@@ -72,6 +98,7 @@ export default {
 
       const info = await env.ROOM.getByName(code).info();
       if (!info) return new Response("room not found", { status: 404 });
+      if (info.closed) return new Response("room closed", { status: 410 });
 
       const shardName = `${code}:${fnv1a(uid) % info.shardCount}`;
       const fwd = new URL(req.url);
@@ -93,7 +120,7 @@ export default {
       return Response.json({ error: "could not allocate a room code" }, { status: 503 });
     }
 
-    // Room info
+    // Room info (public)
     const infoMatch = path.match(/^\/api\/rooms\/([^/]+)$/);
     if (infoMatch && req.method === "GET") {
       const code = infoMatch[1].toLowerCase();
@@ -102,33 +129,57 @@ export default {
       return info ? Response.json(info) : Response.json({ error: "not found" }, { status: 404 });
     }
 
+    // Everything below is host-only: /api/rooms/:code/...
+    const hostRoute = path.match(/^\/api\/rooms\/([^/]+)\/(.+)$/);
+    if (!hostRoute) return new Response("not found", { status: 404 });
+    const code = hostRoute[1].toLowerCase();
+    const rest = hostRoute[2];
+    const host = await isHost(req, env, code);
+    const room = env.ROOM.getByName(code);
+
     // Verify host token
-    const hostMatch = path.match(/^\/api\/rooms\/([^/]+)\/host$/);
-    if (hostMatch && req.method === "POST") {
-      const code = hostMatch[1].toLowerCase();
-      const ok = await isHost(req, env, code);
-      return Response.json({ host: ok }, { status: ok ? 200 : 401 });
+    if (rest === "host" && req.method === "POST") {
+      return Response.json({ host }, { status: host ? 200 : 401 });
     }
 
-    // Host: create a poll
-    const createPoll = path.match(/^\/api\/rooms\/([^/]+)\/polls$/);
-    if (createPoll && req.method === "POST") {
-      const code = createPoll[1].toLowerCase();
-      if (!(await isHost(req, env, code))) return Response.json({ error: "unauthorized" }, { status: 401 });
+    if (!host) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+    // List all polls with final results
+    if (rest === "polls" && req.method === "GET") {
+      return Response.json({ polls: await room.listPolls() });
+    }
+
+    // Create a poll
+    if (rest === "polls" && req.method === "POST") {
       const body = await readJson(req);
       if (body === null) return Response.json({ error: "bad json" }, { status: 400 });
-      const r = await env.ROOM.getByName(code).createPoll(body);
+      const r = await room.createPoll(body);
       return r.ok ? Response.json({ poll: r.value }, { status: 201 }) : Response.json({ error: r.error }, { status: 400 });
     }
 
-    // Host: open / close / reset a poll
-    const pollAction = path.match(/^\/api\/rooms\/([^/]+)\/polls\/([a-f0-9]{8})\/(open|close|reset)$/);
-    if (pollAction && req.method === "POST") {
-      const code = pollAction[1].toLowerCase();
-      if (!(await isHost(req, env, code))) return Response.json({ error: "unauthorized" }, { status: 401 });
-      const action = pollAction[3] as "open" | "close" | "reset";
-      const r = await env.ROOM.getByName(code).setPollState(pollAction[2], action);
+    // Open / close / reset a poll
+    const action = rest.match(/^polls\/([a-f0-9]{8})\/(open|close|reset)$/);
+    if (action && req.method === "POST") {
+      const r = await room.setPollState(action[1], action[2] as "open" | "close" | "reset");
       return r.ok ? Response.json({ poll: r.value }) : Response.json({ error: r.error }, { status: 400 });
+    }
+
+    // Export all polls as CSV
+    if (rest === "export.csv" && req.method === "GET") {
+      const csv = pollsToCsv(await room.listPolls());
+      return new Response(csv, {
+        headers: {
+          "content-type": "text/csv; charset=utf-8",
+          "content-disposition": `attachment; filename="tido-${code}.csv"`,
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    // Close the room
+    if (rest === "close" && req.method === "POST") {
+      const r = await room.closeRoom();
+      return r.ok ? Response.json({ room: r.value }) : Response.json({ error: r.error }, { status: 400 });
     }
 
     return new Response("not found", { status: 404 });

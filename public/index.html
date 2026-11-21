@@ -5,21 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tido</title>
 <style>
-  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafaf7; --card:#fff; --line:#e5e5e0; --accent:#4f46e5; --accent-bg:#eef2ff; --ok:#16a34a; --warn:#d97706; }
+  :root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fafaf7; --card:#fff; --line:#e5e5e0; --accent:#4f46e5; --accent-bg:#eef2ff; --ok:#16a34a; --warn:#d97706; --danger:#dc2626; }
   @media (prefers-color-scheme: dark) { :root { --fg:#f2f2f0; --muted:#a1a1a6; --bg:#141414; --card:#1e1e1e; --line:#2e2e2e; --accent:#818cf8; --accent-bg:#26244a; } }
   * { box-sizing: border-box; }
   body { margin:0; font:16px/1.6 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
   main { max-width:560px; margin:0 auto; padding:40px 20px; }
-  h1 { font-size:28px; margin:0 0 4px; } h2 { font-size:20px; margin:0 0 12px; } .muted { color:var(--muted); }
+  h1 { font-size:28px; margin:0 0 4px; } h2 { font-size:20px; margin:0 0 12px; } h3 { font-size:16px; margin:0 0 8px; }
+  .muted { color:var(--muted); } .small { font-size:13px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin:20px 0; }
   button, input, select { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
   button { cursor:pointer; } button:disabled { opacity:.5; cursor:default; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--danger); border-color:var(--danger); }
   .row { display:flex; gap:8px; align-items:center; } .row input { flex:1; }
+  .between { justify-content:space-between; }
   .stack > * + * { margin-top:8px; }
   .code { font:600 40px/1 ui-monospace, monospace; letter-spacing:6px; }
   .link { display:flex; gap:8px; align-items:center; } .link input { flex:1; font-size:13px; }
-  .err { color:#dc2626; font-size:14px; }
+  .err { color:var(--danger); font-size:14px; }
   .status { display:inline-flex; align-items:center; gap:6px; font-size:14px; color:var(--muted); }
   .dot { width:8px; height:8px; border-radius:50%; background:var(--warn); } .dot.live { background:var(--ok); }
   .badge { font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
@@ -30,6 +33,7 @@
   .track { height:10px; border-radius:5px; background:var(--line); overflow:hidden; }
   .fill { height:100%; background:var(--accent); transition:width .4s ease; }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
+  .past + .past { border-top:1px solid var(--line); padding-top:16px; margin-top:16px; }
 </style>
 </head>
 <body>
@@ -40,6 +44,7 @@ const el = (html) => { app.innerHTML = html; };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 const CODE_RE = /^[23456789abcdefghjkmnpqrstuvwxyz]{6}$/;
+const fmtTime = (iso) => iso ? new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "";
 
 function uid() {
   // Local test mode: ?test on localhost gives each tab its own identity.
@@ -50,16 +55,22 @@ function uid() {
   return id;
 }
 
-/** Live connection: auto-reconnect (exponential backoff + jitter), free keepalives, presence. */
-function live(code, { onMsg, onOpen } = {}) {
-  let tries = 0, pingTimer = null, total = null, state = "connecting", ws = null;
+/** Live connection: auto-reconnect (backoff + jitter), free keepalives, presence, stops when the room ends. */
+function live(code, { onMsg, onOpen, onEnded } = {}) {
+  let tries = 0, pingTimer = null, total = null, state = "connecting", ws = null, stopped = false;
   const render = () => {
     const s = $("status");
     if (!s) return;
     const here = total === null ? "" : ` · ${total} here`;
     s.innerHTML = `<span class="dot ${state === "live" ? "live" : ""}"></span>${state === "live" ? "live" : esc(state)}${here}`;
   };
+  const end = () => { if (stopped) return; stopped = true; clearInterval(pingTimer); onEnded && onEnded(); };
+  const scheduleReconnect = () => {
+    const delay = Math.min(10000, 500 * 2 ** tries++) * (0.5 + Math.random());
+    setTimeout(open, delay);
+  };
   const open = () => {
+    if (stopped) return;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(`${proto}://${location.host}/ws/${code}?uid=${uid()}`);
     ws.onopen = () => {
@@ -72,13 +83,17 @@ function live(code, { onMsg, onOpen } = {}) {
       let msg; try { msg = JSON.parse(e.data); } catch { return; }
       if (msg.type === "presence") { total = msg.total; render(); }
       if (msg.type === "snapshot") { total = msg.presence; render(); }
+      if (msg.type === "room" && msg.closed) { end(); return; }
       onMsg && onMsg(msg);
     };
     ws.onclose = () => {
       clearInterval(pingTimer);
+      if (stopped) return;
       state = "reconnecting"; render();
-      const delay = Math.min(10000, 500 * 2 ** tries++) * (0.5 + Math.random());
-      setTimeout(open, delay);
+      // If the room was closed while we were away, stop instead of retrying forever.
+      fetch(`/api/rooms/${code}`).then((r) => (r.ok ? r.json() : null))
+        .then((info) => (info && info.closed ? end() : scheduleReconnect()))
+        .catch(scheduleReconnect);
     };
   };
   render();
@@ -99,26 +114,56 @@ function pollStore(onChange) {
     else if (msg.type === "voted") { s.yourVote = msg.options; s.error = ""; }
     else if (msg.type === "error") s.error = msg.error;
     else return;
-    onChange();
+    onChange(msg);
   };
   return s;
+}
+
+function barsHtml(options, counts, voters) {
+  const bars = options.map((o, i) => {
+    const c = counts[i] || 0;
+    const pct = voters ? Math.round((100 * c) / voters) : 0;
+    return `<div class="bar"><div class="bar-label"><span>${esc(o)}</span><span class="muted">${c} · ${pct}%</span></div>
+      <div class="track"><div class="fill" style="width:${pct}%"></div></div></div>`;
+  }).join("");
+  return bars + `<p class="muted small" style="margin:4px 0 0">${voters} voted</p>`;
 }
 
 function resultsHtml(poll, results) {
   if (!results || results.pollId !== poll.id || results.round !== poll.round) return "";
   if (!results.counts) return `<p class="muted" style="font-size:14px">Results appear when the poll closes · ${results.voters} voted</p>`;
-  const bars = poll.options.map((o, i) => {
-    const c = results.counts[i] || 0;
-    const pct = results.voters ? Math.round((100 * c) / results.voters) : 0;
-    return `<div class="bar"><div class="bar-label"><span>${esc(o)}</span><span class="muted">${c} · ${pct}%</span></div>
-      <div class="track"><div class="fill" style="width:${pct}%"></div></div></div>`;
-  }).join("");
-  return bars + `<p class="muted" style="font-size:13px;margin:4px 0 0">${results.voters} voted</p>`;
+  return barsHtml(poll.options, results.counts, results.voters);
+}
+
+function pastPollHtml(p, n) {
+  const neverOpened = p.poll.state === "draft";
+  return `<div class="past">
+    <div class="row between"><span class="muted small">Poll ${n}${p.poll.multi ? " · multiple choice" : ""}</span>
+      <span class="muted small">${neverOpened ? "Never opened" : fmtTime(p.createdAt)}</span></div>
+    <h3 style="margin-top:4px">${esc(p.poll.question)}</h3>
+    ${neverOpened ? "" : barsHtml(p.poll.options, p.counts, p.voters)}
+  </div>`;
 }
 
 function copyRow(label, value) {
-  return `<div class="muted" style="font-size:13px;margin-top:12px">${esc(label)}</div>
+  return `<div class="muted small" style="margin-top:12px">${esc(label)}</div>
     <div class="link"><input readonly value="${esc(value)}"><button onclick="navigator.clipboard.writeText(this.previousElementSibling.value);this.textContent='Copied'">Copy</button></div>`;
+}
+
+function hostApi(code, token) {
+  const headers = { authorization: "Bearer " + token, "content-type": "application/json" };
+  return {
+    post: (path, body) => fetch(`/api/rooms/${code}${path}`, { method: "POST", headers, body: body ? JSON.stringify(body) : undefined }),
+    get: (path) => fetch(`/api/rooms/${code}${path}`, { headers }),
+    async exportCsv() {
+      const r = await fetch(`/api/rooms/${code}/export.csv`, { headers });
+      if (!r.ok) return alert("Export failed");
+      const url = URL.createObjectURL(await r.blob());
+      const a = Object.assign(document.createElement("a"), { href: url, download: `tido-${code}.csv` });
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    },
+  };
 }
 
 // ---------------- Landing ----------------
@@ -151,9 +196,33 @@ async function host(code) {
   if (hash.get("t")) { localStorage.setItem("tido:host:" + code, hash.get("t")); history.replaceState(null, "", location.pathname); }
   const token = localStorage.getItem("tido:host:" + code);
   if (!token) return el(`<h1>Not authorized</h1><p class="muted">Open the host link you saved when creating this room.</p>`);
-  const ok = await fetch(`/api/rooms/${code}/host`, { method: "POST", headers: { authorization: "Bearer " + token } });
-  if (!ok.ok) return el(`<h1>Not authorized</h1><p class="muted">This host link is invalid for room ${esc(code)}.</p>`);
+  const api = hostApi(code, token);
+  if (!(await api.post("/host")).ok) return el(`<h1>Not authorized</h1><p class="muted">This host link is invalid for room ${esc(code)}.</p>`);
 
+  const info = await (await fetch(`/api/rooms/${code}`)).json();
+  if (info.closed) return hostResults(code, token);
+  hostLive(code, token, api);
+}
+
+/** Results page: shown to the host after the room is closed. */
+async function hostResults(code, token) {
+  const api = hostApi(code, token);
+  const [info, data] = await Promise.all([
+    fetch(`/api/rooms/${code}`).then((r) => r.json()),
+    api.get("/polls").then((r) => r.json()),
+  ]);
+  const polls = data.polls || [];
+  const ran = polls.filter((p) => p.poll.state !== "draft").length;
+  el(`<p class="muted">Results · host only</p>
+    <div class="row between"><div class="code">${esc(code)}</div><span class="badge">Room closed</span></div>
+    <p class="muted small" style="margin-top:12px">Started ${esc(fmtTime(info.createdAt))} · ended ${esc(fmtTime(info.closedAt))} · ${ran} poll${ran === 1 ? "" : "s"} run</p>
+    <div class="actions"><button class="primary" id="export">Export CSV</button><a href="/"><button>New room</button></a></div>
+    <div class="card">${polls.length ? polls.map((p, i) => pastPollHtml(p, i + 1)).join("") : `<p class="muted" style="margin:0">No polls were created in this room.</p>`}</div>
+    <p class="muted small">Bookmark this page or keep your host link to come back to these results.</p>`);
+  $("export").onclick = () => api.exportCsv();
+}
+
+function hostLive(code, token, api) {
   const base = location.origin;
   el(`<p class="muted">Host view · <span id="status" class="status"></span></p><div class="code">${esc(code)}</div>
     <div class="card">${copyRow("Audience link — share this", `${base}/r/${code}`)}
@@ -166,16 +235,31 @@ async function host(code) {
         <button id="addOpt">+ Add option</button>
         <label class="row" style="font-size:14px"><input type="checkbox" id="multi" style="flex:none"> Allow multiple choices</label>
         <label class="row" style="font-size:14px">Results:
-          <select id="show" style="flex:1"><option value="live">Visible live</option><option value="after">After poll closes</option></select></label>
+          <select id="show" style="flex:1"><option value="after" selected>After poll closes</option><option value="live">Visible live</option></select></label>
       </div>
+      <p class="muted small" id="replaceNote" style="display:none">The current poll will be closed when you create this one.</p>
       <div class="actions"><button class="primary" id="create">Create poll</button><button id="cancel">Cancel</button></div>
       <div id="composeErr" class="err"></div>
     </div>
-    <div class="card" id="pollCard"></div>`);
+    <div class="card" id="pollCard"></div>
+    <div class="card">
+      <div class="row between"><h2 style="margin:0">Past polls</h2><button id="export">Export CSV</button></div>
+      <div id="past" style="margin-top:12px"></div>
+    </div>
+    <div class="card">
+      <div class="row between"><div><h3 style="margin:0">End this room</h3>
+        <span class="muted small">Closes voting and disconnects everyone. Results stay available here.</span></div>
+        <button class="danger" id="closeRoom">Close room</button></div>
+    </div>`);
 
-  const api = (path) => fetch(`/api/rooms/${code}${path}`, {
-    method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" },
-  });
+  $("export").onclick = () => api.exportCsv();
+  $("closeRoom").onclick = async () => {
+    if (!confirm("Close this room for everyone? Voting ends and the audience is disconnected. This can't be undone.")) return;
+    $("closeRoom").disabled = true;
+    const r = await api.post("/close");
+    if (!r.ok) { $("closeRoom").disabled = false; return alert("Could not close the room"); }
+    hostResults(code, token);
+  };
 
   // --- composer ---
   const addOptRow = (value = "") => {
@@ -190,22 +274,38 @@ async function host(code) {
   const showComposer = (on) => {
     $("composer").style.display = on ? "block" : "none";
     $("pollCard").style.display = on ? "none" : "block";
-    if (on) { $("q").value = ""; $("opts").innerHTML = ""; addOptRow(); addOptRow(); $("composeErr").textContent = ""; $("q").focus(); }
+    if (on) {
+      $("q").value = ""; $("opts").innerHTML = ""; addOptRow(); addOptRow(); $("composeErr").textContent = "";
+      $("replaceNote").style.display = store.poll && store.poll.state === "open" ? "block" : "none";
+      $("q").focus();
+    }
   };
   $("addOpt").onclick = () => addOptRow();
   $("cancel").onclick = () => showComposer(false);
   $("create").onclick = async () => {
     const options = [...$("opts").querySelectorAll("input")].map((i) => i.value.trim()).filter(Boolean);
-    const body = JSON.stringify({ question: $("q").value.trim(), options, multi: $("multi").checked, showResults: $("show").value });
-    const r = await fetch(`/api/rooms/${code}/polls`, {
-      method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" }, body,
-    });
+    const r = await api.post("/polls", { question: $("q").value.trim(), options, multi: $("multi").checked, showResults: $("show").value });
     if (!r.ok) { $("composeErr").textContent = (await r.json().catch(() => ({}))).error || "Could not create poll"; return; }
     showComposer(false);
   };
 
+  // --- past polls (everything except the active one) ---
+  let pastTimer = null;
+  const loadPast = () => {
+    clearTimeout(pastTimer);
+    pastTimer = setTimeout(async () => {
+      const r = await api.get("/polls");
+      if (!r.ok) return;
+      const all = (await r.json()).polls || [];
+      const past = all.map((p, i) => ({ p, n: i + 1 })).filter(({ p }) => !store.poll || p.poll.id !== store.poll.id);
+      $("past").innerHTML = past.length
+        ? past.reverse().map(({ p, n }) => pastPollHtml(p, n)).join("")
+        : `<p class="muted" style="margin:0">Finished polls will show up here.</p>`;
+    }, 300);
+  };
+
   // --- active poll ---
-  const store = pollStore(() => render());
+  const store = pollStore((msg) => { render(); if (msg.type === "poll" || msg.type === "snapshot") loadPast(); });
   const render = () => {
     const p = store.poll;
     if (!p) {
@@ -213,8 +313,8 @@ async function host(code) {
     } else {
       const label = { draft: "Draft · hidden from audience", open: "Open", closed: "Closed" }[p.state];
       $("pollCard").innerHTML = `
-        <div class="row" style="justify-content:space-between"><span class="badge ${p.state === "open" ? "open" : ""}">${label}</span>
-          <span class="muted" style="font-size:13px">${p.multi ? "Multiple choice" : "Single choice"} · results ${p.showResults === "live" ? "live" : "after close"}</span></div>
+        <div class="row between"><span class="badge ${p.state === "open" ? "open" : ""}">${label}</span>
+          <span class="muted small">${p.multi ? "Multiple choice" : "Single choice"} · results ${p.showResults === "live" ? "live" : "after close"}</span></div>
         <h2 style="margin-top:12px">${esc(p.question)}</h2>
         ${resultsHtml(p, store.results)}
         <div class="actions">
@@ -227,7 +327,7 @@ async function host(code) {
         b.onclick = async () => {
           if (b.dataset.act === "reset" && !confirm("Clear all votes for this poll?")) return;
           b.disabled = true;
-          await api(`/polls/${p.id}/${b.dataset.act}`);
+          await api.post(`/polls/${p.id}/${b.dataset.act}`);
           b.disabled = false;
         };
       });
@@ -235,16 +335,26 @@ async function host(code) {
     $("newPoll").onclick = () => showComposer(true);
   };
 
-  const conn = live(code, { onMsg: store.apply, onOpen: () => conn.send({ type: "auth", token }) });
+  const conn = live(code, {
+    onMsg: store.apply,
+    onOpen: () => conn.send({ type: "auth", token }),
+    onEnded: () => hostResults(code, token),
+  });
   render();
+  loadPast();
 }
 
 // ---------------- Audience ----------------
+
+function roomEnded() {
+  el(`<h1>This room has ended</h1><p class="muted">Thanks for taking part.</p><p><a href="/">Go to Tido</a></p>`);
+}
 
 async function audience(code) {
   const r = await fetch(`/api/rooms/${code}`);
   if (r.status === 404) return el(`<h1>Room not found</h1><p class="muted">Check the code and try again. <a href="/">Back</a></p>`);
   if (!r.ok) return el(`<h1>Something went wrong</h1>`);
+  if ((await r.json()).closed) return roomEnded();
 
   el(`<p class="muted">Room <b>${esc(code)}</b> · <span id="status" class="status"></span></p><div class="card" id="pollCard"></div>`);
 
@@ -259,13 +369,13 @@ async function audience(code) {
     const chosen = new Set(store.yourVote || []);
     const canVote = p.state === "open";
     const optsHtml = p.options.map((o, i) => p.multi
-      ? `<label class="opt btn-like card" style="margin:8px 0;padding:12px 16px;display:flex;gap:10px;align-items:center">
+      ? `<label class="card" style="margin:8px 0;padding:12px 16px;display:flex;gap:10px;align-items:center">
            <input type="checkbox" data-i="${i}" ${chosen.has(i) ? "checked" : ""} ${canVote ? "" : "disabled"}> ${esc(o)}</label>`
       : `<button class="opt ${chosen.has(i) ? "chosen" : ""}" data-i="${i}" style="margin:8px 0" ${canVote ? "" : "disabled"}>${esc(o)}</button>`
     ).join("");
     $("pollCard").innerHTML = `
-      <div class="row" style="justify-content:space-between"><span class="badge ${canVote ? "open" : ""}">${canVote ? "Voting open" : "Voting closed"}</span>
-        ${store.yourVote ? `<span class="muted" style="font-size:13px">✓ Vote recorded${canVote ? " · tap to change" : ""}</span>` : ""}</div>
+      <div class="row between"><span class="badge ${canVote ? "open" : ""}">${canVote ? "Voting open" : "Voting closed"}</span>
+        ${store.yourVote ? `<span class="muted small">✓ Vote recorded${canVote ? " · tap to change" : ""}</span>` : ""}</div>
       <h2 style="margin-top:12px">${esc(p.question)}</h2>
       ${optsHtml}
       ${p.multi && canVote ? `<button class="primary" id="submitMulti">Submit</button>` : ""}
@@ -286,7 +396,7 @@ async function audience(code) {
     }
   };
 
-  conn = live(code, { onMsg: store.apply });
+  conn = live(code, { onMsg: store.apply, onEnded: roomEnded });
   render();
 }
 
