@@ -25,9 +25,24 @@ export type Snapshot = { poll: Poll | null; results: Results | null; presence: n
 
 export type PastPoll = { poll: Poll; counts: number[]; voters: number; createdAt: string };
 
-export type RoomInfo = { code: string; createdAt: string; shardCount: number; closed: boolean; closedAt: string | null };
+export type CloseReason = "host" | "expired" | "idle";
+
+export type RoomInfo = {
+  code: string;
+  createdAt: string;
+  shardCount: number;
+  closed: boolean;
+  closedAt: string | null;
+  closedReason: CloseReason | null;
+  expiresAt: string;
+  maxExpiresAt: string;
+  idleMinutes: number;
+};
 
 type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+const MIN = 60_000;
+const EXTEND_MS = 30 * MIN;
 
 export class RoomDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -42,6 +57,17 @@ export class RoomDO extends DurableObject<Env> {
         counts TEXT NOT NULL, voters INTEGER NOT NULL,
         PRIMARY KEY (poll_id, round, shard))`);
     });
+  }
+
+  // ---------- config ----------
+
+  private cfg() {
+    const n = (v: string | undefined, d: number) => (Number(v) > 0 ? Number(v) : d);
+    return {
+      idleMs: n(this.env.ROOM_IDLE_MINUTES, 10) * MIN,
+      defaultMs: n(this.env.ROOM_DEFAULT_MINUTES, 60) * MIN,
+      maxMs: n(this.env.ROOM_MAX_MINUTES, 180) * MIN,
+    };
   }
 
   // ---------- small helpers ----------
@@ -63,6 +89,27 @@ export class RoomDO extends DurableObject<Env> {
 
   private isClosed(): boolean {
     return this.get("closed_at") !== null;
+  }
+
+  private createdMs(): number {
+    return Date.parse(this.get("created_at") ?? new Date().toISOString());
+  }
+
+  private expiresMs(): number {
+    const e = this.get("expires_at");
+    return e ? Date.parse(e) : this.createdMs() + this.cfg().defaultMs;
+  }
+
+  private maxExpiresMs(): number {
+    return this.createdMs() + this.cfg().maxMs;
+  }
+
+  /** When the room became empty (nobody connected), or null if someone is here. */
+  private emptySinceMs(): number | null {
+    const v = this.get("empty_since");
+    if (v === "") return null;
+    if (v === null) return this.presence() === 0 ? this.createdMs() : null; // rooms from before this feature
+    return Date.parse(v);
   }
 
   private activePoll(): Poll | null {
@@ -129,28 +176,83 @@ export class RoomDO extends DurableObject<Env> {
     await this.fanout(r);
   }
 
+  // ---------- auto-close ----------
+
+  private dueReason(now = Date.now()): CloseReason | null {
+    if (now >= this.expiresMs()) return "expired";
+    const empty = this.emptySinceMs();
+    if (empty !== null && now - empty >= this.cfg().idleMs) return "idle";
+    return null;
+  }
+
+  /** Closes the room if it is past its deadline. Returns true if the room is (now) closed. */
+  private async expireIfDue(): Promise<boolean> {
+    if (!this.get("code")) return false;
+    if (this.isClosed()) return true;
+    const reason = this.dueReason();
+    if (!reason) return false;
+    await this.close(reason);
+    return true;
+  }
+
+  /** Arm the alarm for the next deadline: expiry, or idle timeout if the room is empty. */
+  private async scheduleAlarm() {
+    if (this.isClosed() || !this.get("code")) return;
+    let next = this.expiresMs();
+    const empty = this.emptySinceMs();
+    if (empty !== null) next = Math.min(next, empty + this.cfg().idleMs);
+    await this.ctx.storage.setAlarm(next);
+  }
+
+  async alarm() {
+    if (!(await this.expireIfDue())) await this.scheduleAlarm();
+  }
+
+  private async close(reason: CloseReason) {
+    if (this.isClosed()) return;
+    const p = this.activePoll();
+    if (p && p.state !== "closed") {
+      p.state = "closed";
+      this.savePoll(p);
+      await this.fanout({ type: "poll", poll: p });
+      await this.broadcastResults(p);
+    }
+    this.set("closed_at", new Date().toISOString());
+    this.set("closed_reason", reason);
+    await this.ctx.storage.deleteAlarm();
+    await this.fanout({ type: "room", closed: true, reason });
+  }
+
   // ---------- room lifecycle ----------
 
   /** Returns false if this code is already taken. */
   async init(code: string, hostTokenHash: string): Promise<boolean> {
     if (this.get("code")) return false;
+    const now = Date.now();
     this.set("code", code);
     this.set("host_hash", hostTokenHash);
-    this.set("created_at", new Date().toISOString());
+    this.set("created_at", new Date(now).toISOString());
+    this.set("expires_at", new Date(now + this.cfg().defaultMs).toISOString());
+    this.set("empty_since", new Date(now).toISOString());
     this.set("shard_count", "1");
+    await this.scheduleAlarm();
     return true;
   }
 
   async info(): Promise<RoomInfo | null> {
     const code = this.get("code");
     if (!code) return null;
-    const closedAt = this.get("closed_at");
+    await this.expireIfDue();
     return {
       code,
       createdAt: this.get("created_at")!,
       shardCount: Number(this.get("shard_count") ?? "1"),
-      closed: closedAt !== null,
-      closedAt,
+      closed: this.isClosed(),
+      closedAt: this.get("closed_at"),
+      closedReason: (this.get("closed_reason") as CloseReason | null) ?? (this.isClosed() ? "host" : null),
+      expiresAt: new Date(this.expiresMs()).toISOString(),
+      maxExpiresAt: new Date(this.maxExpiresMs()).toISOString(),
+      idleMinutes: this.cfg().idleMs / MIN,
     };
   }
 
@@ -159,19 +261,22 @@ export class RoomDO extends DurableObject<Env> {
     return stored !== null && stored === tokenHash;
   }
 
-  /** Ends the room: closes the active poll, tells every client, blocks new polls and votes. */
+  /** Host ends the room. */
   async closeRoom(): Promise<Result<RoomInfo>> {
-    if (!this.isClosed()) {
-      const p = this.activePoll();
-      if (p && p.state !== "closed") {
-        p.state = "closed";
-        this.savePoll(p);
-        await this.fanout({ type: "poll", poll: p });
-        await this.broadcastResults(p);
-      }
-      this.set("closed_at", new Date().toISOString());
-      await this.fanout({ type: "room", closed: true });
-    }
+    await this.close("host");
+    return { ok: true, value: (await this.info())! };
+  }
+
+  /** Host adds 30 minutes, up to the maximum room length. */
+  async extend(): Promise<Result<RoomInfo>> {
+    if (await this.expireIfDue()) return { ok: false, error: "room is closed" };
+    const current = this.expiresMs();
+    const max = this.maxExpiresMs();
+    if (current >= max) return { ok: false, error: "room is already at the maximum length" };
+    const next = Math.min(current + EXTEND_MS, max);
+    this.set("expires_at", new Date(next).toISOString());
+    await this.scheduleAlarm();
+    await this.fanout({ type: "room", closed: false, expiresAt: new Date(next).toISOString() });
     return { ok: true, value: (await this.info())! };
   }
 
@@ -207,8 +312,13 @@ export class RoomDO extends DurableObject<Env> {
       sockets
     );
     const total = sql.exec<{ t: number }>(`SELECT COALESCE(SUM(sockets), 0) AS t FROM shards`).one().t;
-    if (total !== Number(this.get("presence_total") ?? "-1")) {
+    const previous = Number(this.get("presence_total") ?? "-1");
+    if (total !== previous) {
       this.set("presence_total", String(total));
+      // Track emptiness for the idle timeout.
+      if (total === 0) this.set("empty_since", new Date().toISOString());
+      else this.set("empty_since", "");
+      await this.scheduleAlarm();
       await this.fanout({ type: "presence", total });
     }
 
@@ -230,7 +340,7 @@ export class RoomDO extends DurableObject<Env> {
   // ---------- host actions ----------
 
   async createPoll(input: unknown): Promise<Result<Poll>> {
-    if (this.isClosed()) return { ok: false, error: "room is closed" };
+    if (await this.expireIfDue()) return { ok: false, error: "room is closed" };
     const i = (input ?? {}) as Record<string, unknown>;
     const question = typeof i.question === "string" ? i.question.trim() : "";
     if (question.length < 1 || question.length > 200) return { ok: false, error: "question must be 1–200 characters" };
@@ -262,7 +372,7 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   async setPollState(id: string, action: "open" | "close" | "reset"): Promise<Result<Poll>> {
-    if (this.isClosed()) return { ok: false, error: "room is closed" };
+    if (await this.expireIfDue()) return { ok: false, error: "room is closed" };
     const p = this.activePoll();
     if (!p || p.id !== id) return { ok: false, error: "poll not found or not active" };
     if (action === "open") p.state = "open";

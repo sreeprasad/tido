@@ -176,6 +176,12 @@ export default {
       });
     }
 
+    // Extend the room by 30 minutes (up to the maximum length)
+    if (rest === "extend" && req.method === "POST") {
+      const r = await room.extend();
+      return r.ok ? Response.json({ room: r.value }) : Response.json({ error: r.error }, { status: 400 });
+    }
+
     // Close the room
     if (rest === "close" && req.method === "POST") {
       const r = await room.closeRoom();

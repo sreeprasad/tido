@@ -44,6 +44,7 @@ const el = (html) => { app.innerHTML = html; };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 const CODE_RE = /^[23456789abcdefghjkmnpqrstuvwxyz]{6}$/;
+const CLOSE_REASONS = { host: "closed by host", expired: "closed automatically (time limit)", idle: "closed automatically (nobody connected)" };
 const fmtTime = (iso) => iso ? new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "";
 
 function uid() {
@@ -201,7 +202,7 @@ async function host(code) {
 
   const info = await (await fetch(`/api/rooms/${code}`)).json();
   if (info.closed) return hostResults(code, token);
-  hostLive(code, token, api);
+  hostLive(code, token, api, info);
 }
 
 /** Results page: shown to the host after the room is closed. */
@@ -215,14 +216,14 @@ async function hostResults(code, token) {
   const ran = polls.filter((p) => p.poll.state !== "draft").length;
   el(`<p class="muted">Results · host only</p>
     <div class="row between"><div class="code">${esc(code)}</div><span class="badge">Room closed</span></div>
-    <p class="muted small" style="margin-top:12px">Started ${esc(fmtTime(info.createdAt))} · ended ${esc(fmtTime(info.closedAt))} · ${ran} poll${ran === 1 ? "" : "s"} run</p>
+    <p class="muted small" style="margin-top:12px">Started ${esc(fmtTime(info.createdAt))} · ended ${esc(fmtTime(info.closedAt))} · ${ran} poll${ran === 1 ? "" : "s"} run · ${esc(CLOSE_REASONS[info.closedReason] || "closed")}</p>
     <div class="actions"><button class="primary" id="export">Export CSV</button><a href="/"><button>New room</button></a></div>
     <div class="card">${polls.length ? polls.map((p, i) => pastPollHtml(p, i + 1)).join("") : `<p class="muted" style="margin:0">No polls were created in this room.</p>`}</div>
     <p class="muted small">Bookmark this page or keep your host link to come back to these results.</p>`);
   $("export").onclick = () => api.exportCsv();
 }
 
-function hostLive(code, token, api) {
+function hostLive(code, token, api, info) {
   const base = location.origin;
   el(`<p class="muted">Host view · <span id="status" class="status"></span></p><div class="code">${esc(code)}</div>
     <div class="card">${copyRow("Audience link — share this", `${base}/r/${code}`)}
@@ -248,8 +249,9 @@ function hostLive(code, token, api) {
     </div>
     <div class="card">
       <div class="row between"><div><h3 style="margin:0">End this room</h3>
-        <span class="muted small">Closes voting and disconnects everyone. Results stay available here.</span></div>
-        <button class="danger" id="closeRoom">Close room</button></div>
+        <span class="muted small">Closes voting and disconnects everyone. Results stay available here.</span>
+        <div class="muted small" id="expiry" style="margin-top:6px"></div></div>
+        <div class="row" style="flex:none"><button id="extend">+30 min</button><button class="danger" id="closeRoom">Close room</button></div></div>
     </div>`);
 
   $("export").onclick = () => api.exportCsv();
@@ -260,6 +262,22 @@ function hostLive(code, token, api) {
     if (!r.ok) { $("closeRoom").disabled = false; return alert("Could not close the room"); }
     hostResults(code, token);
   };
+
+  // --- auto-close info + extend ---
+  let expiresAt = info.expiresAt;
+  const renderExpiry = () => {
+    const atMax = Date.parse(expiresAt) >= Date.parse(info.maxExpiresAt);
+    const at = new Date(expiresAt).toLocaleTimeString([], { timeStyle: "short" });
+    $("expiry").textContent = `Closes automatically at ${at}${atMax ? " (maximum length)" : ""}, or after ${info.idleMinutes} min with nobody connected.`;
+    $("extend").disabled = atMax;
+  };
+  $("extend").onclick = async () => {
+    $("extend").disabled = true;
+    const r = await api.post("/extend");
+    if (r.ok) expiresAt = (await r.json()).room.expiresAt;
+    renderExpiry();
+  };
+  renderExpiry();
 
   // --- composer ---
   const addOptRow = (value = "") => {
@@ -336,7 +354,10 @@ function hostLive(code, token, api) {
   };
 
   const conn = live(code, {
-    onMsg: store.apply,
+    onMsg: (m) => {
+      if (m.type === "room" && m.expiresAt) { expiresAt = m.expiresAt; renderExpiry(); }
+      store.apply(m);
+    },
     onOpen: () => conn.send({ type: "auth", token }),
     onEnded: () => hostResults(code, token),
   });
